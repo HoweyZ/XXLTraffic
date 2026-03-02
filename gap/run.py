@@ -88,6 +88,24 @@ if __name__ == '__main__':
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
+    # BTTA-style parameter subspace losses
+    parser.add_argument('--enable_btta', action='store_true', default=False,
+                        help='enable BTTA plug-and-play auxiliary losses (S/D/M subspaces)')
+    parser.add_argument('--btta_stage', type=str, default='full', choices=['pretrain', 'bta', 'btta', 'full'],
+                        help='training stage that controls which subspace losses are active')
+    parser.add_argument('--lambda_s', type=float, default=0.0, help='weight for stable-mechanism loss')
+    parser.add_argument('--lambda_d', type=float, default=0.0, help='weight for drift-level loss')
+    parser.add_argument('--lambda_m', type=float, default=0.0, help='weight for measurement loss')
+    parser.add_argument('--mu_grad', type=float, default=0.0, help='gradient decorrelation regularization weight')
+    parser.add_argument('--stable_agg_scale', type=int, default=12,
+                        help='aggregation window size used by stable multi-scale consistency loss')
+    parser.add_argument('--trend_kernel', type=int, default=25,
+                        help='moving-average kernel for trend extraction in drift loss')
+    parser.add_argument('--measurement_mask_ratio', type=float, default=0.15,
+                        help='mask ratio for measurement-space masked reconstruction objective')
+    parser.add_argument('--freeze_backbone_in_btta', action='store_true', default=False,
+                        help='freeze backbone parameters when btta_stage=btta and only optimize adapters')
+
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
