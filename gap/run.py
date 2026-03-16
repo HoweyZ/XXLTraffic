@@ -88,23 +88,27 @@ if __name__ == '__main__':
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
-    # BTTA-style parameter subspace losses
-    parser.add_argument('--enable_btta', action='store_true', default=False,
-                        help='enable BTTA plug-and-play auxiliary losses (S/D/M subspaces)')
-    parser.add_argument('--btta_stage', type=str, default='full', choices=['pretrain', 'bta', 'btta', 'full'],
-                        help='training stage that controls which subspace losses are active')
-    parser.add_argument('--lambda_s', type=float, default=0.0, help='weight for stable-mechanism loss')
-    parser.add_argument('--lambda_d', type=float, default=0.0, help='weight for drift-level loss')
-    parser.add_argument('--lambda_m', type=float, default=0.0, help='weight for measurement loss')
-    parser.add_argument('--mu_grad', type=float, default=0.0, help='gradient decorrelation regularization weight')
-    parser.add_argument('--stable_agg_scale', type=int, default=12,
-                        help='aggregation window size used by stable multi-scale consistency loss')
-    parser.add_argument('--trend_kernel', type=int, default=25,
-                        help='moving-average kernel for trend extraction in drift loss')
-    parser.add_argument('--measurement_mask_ratio', type=float, default=0.15,
-                        help='mask ratio for measurement-space masked reconstruction objective')
-    parser.add_argument('--freeze_backbone_in_btta', action='store_true', default=False,
-                        help='freeze backbone parameters when btta_stage=btta and only optimize adapters')
+    # CAMEL plug-and-play module
+    parser.add_argument('--enable_camel', action='store_true', default=False,
+                        help='enable CAMEL plug-and-play enhancer before backbone')
+    parser.add_argument('--camel_gap_years', type=float, default=0.0,
+                        help='gap in years for CAMEL latent extrapolation')
+    parser.add_argument('--camel_memory_size', type=int, default=1196,
+                        help='memory bank size for CAMEL CEM')
+    parser.add_argument('--camel_k_retrieve', type=int, default=8,
+                        help='top-k memory retrieval count')
+    parser.add_argument('--camel_latent_dim', type=int, default=32,
+                        help='latent dimension for CAMEL LDE')
+    parser.add_argument('--camel_d_model', type=int, default=32,
+                        help='feature dimension used inside CAMEL memory/dynamics/fusion modules')
+    parser.add_argument('--camel_use_nll', action='store_true', default=False,
+                        help='use CAMEL uncertainty-aware NLL as prediction loss')
+    parser.add_argument('--lambda_mem', type=float, default=0.10,
+                        help='weight for CAMEL memory contrastive loss')
+    parser.add_argument('--lambda_ode', type=float, default=0.05,
+                        help='weight for CAMEL ODE reconstruction loss')
+    parser.add_argument('--lambda_smooth', type=float, default=0.01,
+                        help='weight for CAMEL ODE smoothness loss')
 
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')

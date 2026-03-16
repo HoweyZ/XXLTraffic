@@ -10,8 +10,8 @@ import time
 import warnings
 import numpy as np
 from thop import profile, clever_format
+from models.CAMEL import CAMEL, NLLLoss
 import torch.nn.functional as F
-from itertools import combinations
 
 
 warnings.filterwarnings('ignore')
@@ -20,6 +20,18 @@ warnings.filterwarnings('ignore')
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
+        self.camel = CAMEL(
+            d_model=args.camel_d_model,
+            N_nodes=args.enc_in,
+            memory_size=args.camel_memory_size,
+            K_retrieve=args.camel_k_retrieve,
+            d_latent=args.camel_latent_dim,
+            horizon=args.pred_len,
+            lambda_mem=args.lambda_mem,
+            lambda_ode=args.lambda_ode,
+            lambda_smt=args.lambda_smooth
+        ).to(self.device) if args.enable_camel else None
+        self.nll_criterion = NLLLoss()
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
@@ -33,123 +45,80 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        params = self.model.parameters()
-        if self.args.enable_btta and self.args.btta_stage == 'btta' and self.args.freeze_backbone_in_btta:
-            for p in self.model.parameters():
-                p.requires_grad = False
-            params = [p for p in self.model.parameters() if p.requires_grad]
-            if len(params) == 0:
-                print('Warning: backbone is frozen in BTTA stage and no adapters are registered; falling back to full-model update.')
-                for p in self.model.parameters():
-                    p.requires_grad = True
-                params = self.model.parameters()
-
-        model_optim = optim.Adam(params, lr=self.args.learning_rate)
-        return model_optim
+        return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
-        return criterion
+        return nn.MSELoss()
 
-    def _extract_trend(self, x):
-        kernel = max(1, int(self.args.trend_kernel))
-        if kernel % 2 == 0:
-            kernel += 1
-        x_reshape = x.transpose(1, 2)
-        trend = F.avg_pool1d(x_reshape, kernel_size=kernel, stride=1, padding=kernel // 2)
-        return trend.transpose(1, 2)
+    def _extract_camel_meta(self, batch_x_mark, batch_x, global_step):
+        B = batch_x.shape[0]
+        season_q = torch.zeros(B, dtype=torch.long, device=batch_x.device)
+        year_q = torch.zeros(B, dtype=batch_x.dtype, device=batch_x.device)
 
-    def _stable_loss(self, outputs, target):
-        scale = max(1, int(self.args.stable_agg_scale))
-        if outputs.shape[1] < scale:
-            return outputs.new_tensor(0.0)
-        valid_len = (outputs.shape[1] // scale) * scale
-        outputs_agg = outputs[:, :valid_len, :].reshape(outputs.shape[0], valid_len // scale, scale, outputs.shape[2]).mean(dim=2)
-        target_agg = target[:, :valid_len, :].reshape(target.shape[0], valid_len // scale, scale, target.shape[2]).mean(dim=2)
-        return F.mse_loss(outputs_agg, target_agg)
+        if batch_x_mark is not None and batch_x_mark.shape[-1] > 0:
+            month_like = batch_x_mark[:, -1, 0]
+            if month_like.min() >= 1 and month_like.max() <= 12:
+                season_q = ((month_like.long() - 1) // 3).clamp(min=0, max=3)
 
-    def _drift_loss(self, outputs, target):
-        return F.mse_loss(self._extract_trend(outputs), self._extract_trend(target))
-
-    def _measurement_loss(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, outputs, target):
-        mask_ratio = float(self.args.measurement_mask_ratio)
-        if mask_ratio <= 0:
-            return outputs.new_tensor(0.0)
-
-        x_mask = (torch.rand_like(batch_x) > mask_ratio).float()
-        masked_x = batch_x * x_mask
-        if self.args.output_attention:
-            masked_outputs = self.model(masked_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+            # If camel_mark is enabled in dataset, the last dimension carries normalized year.
+            if batch_x_mark.shape[-1] >= 5:
+                year_q = batch_x_mark[:, -1, -1].float().clamp(0.0, 1.0)
+            else:
+                year_q = torch.full_like(year_q, float(global_step % 1024) / 1024.0)
         else:
-            masked_outputs = self.model(masked_x, batch_x_mark, dec_inp, batch_y_mark)
+            year_q = torch.full_like(year_q, float(global_step % 1024) / 1024.0)
+        return season_q, year_q
 
-        f_dim = -1 if self.args.features == 'MS' else 0
-        masked_outputs = masked_outputs[:, -self.args.pred_len:, f_dim:]
-        omega = (torch.rand_like(target) < mask_ratio).float()
-        recon = F.l1_loss(masked_outputs * omega, target * omega)
+    def _print_camel_strategy(self):
+        if not self.args.enable_camel:
+            print('CAMEL disabled: backbone-only training with task loss.')
+            return
+        print(f"CAMEL enabled: gap_years={self.args.camel_gap_years}, memory_size={self.args.camel_memory_size}, K={self.args.camel_k_retrieve}")
+        print(f"CAMEL loss weights: lambda_mem={self.args.lambda_mem}, lambda_ode={self.args.lambda_ode}, lambda_smooth={self.args.lambda_smooth}")
+        print(f"CAMEL uncertainty NLL: {'on' if self.args.camel_use_nll else 'off'}")
 
-        error_signal = (masked_outputs - outputs.detach()).abs()
-        logits = (error_signal - error_signal.mean(dim=1, keepdim=True))
-        pattern = F.binary_cross_entropy_with_logits(logits, omega)
-        return recon + pattern
+    def _forward_backbone(self, batch_x, batch_x_mark, dec_inp, batch_y_mark):
+        model_x_mark = batch_x_mark
+        model_y_mark = batch_y_mark
+        if batch_x_mark is not None and batch_x_mark.shape[-1] > 4:
+            model_x_mark = batch_x_mark[..., :4]
+        if batch_y_mark is not None and batch_y_mark.shape[-1] > 4:
+            model_y_mark = batch_y_mark[..., :4]
 
-    def _gradient_decorrelation(self, losses, outputs):
-        valid = [loss for loss in losses if loss is not None]
-        if len(valid) < 2:
-            return outputs.new_tensor(0.0)
-
-        grads = []
-        for loss in valid:
-            grad = torch.autograd.grad(loss, outputs, retain_graph=True, create_graph=True, allow_unused=True)[0]
-            if grad is not None:
-                grads.append(grad.reshape(grad.shape[0], -1).mean(dim=0))
-        if len(grads) < 2:
-            return outputs.new_tensor(0.0)
-
-        reg = outputs.new_tensor(0.0)
-        for g1, g2 in combinations(grads, 2):
-            reg = reg + torch.abs(F.cosine_similarity(g1, g2, dim=0, eps=1e-8))
-        return reg
-
-    def _stage_lambdas(self):
-        ls, ld, lm = self.args.lambda_s, self.args.lambda_d, self.args.lambda_m
-        if not self.args.enable_btta:
-            return 0.0, 0.0, 0.0
-        if self.args.btta_stage == 'pretrain':
-            return ls, 0.0, lm
-        if self.args.btta_stage == 'bta':
-            return ls, ld, lm
-        if self.args.btta_stage == 'btta':
-            return 0.0, 0.0, lm
-        return ls, ld, lm
-
-    def _compute_total_loss(self, batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion):
         if self.args.output_attention:
-            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+            return self.model(batch_x, model_x_mark, dec_inp, model_y_mark)[0]
+        return self.model(batch_x, model_x_mark, dec_inp, model_y_mark)
+
+    def _compute_total_loss(self, batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=0):
+        if self.camel is not None:
+            season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step)
+            batch_x_enh, sigma, aux_losses = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=self.model.training)
         else:
-            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            batch_x_enh, sigma = batch_x, None
+            aux_losses = {
+                'mem': batch_x.new_tensor(0.0),
+                'ode': batch_x.new_tensor(0.0),
+                'smooth': batch_x.new_tensor(0.0)
+            }
+
+        outputs = self._forward_backbone(batch_x_enh, batch_x_mark, dec_inp, batch_y_mark)
 
         f_dim = -1 if self.args.features == 'MS' else 0
         outputs = outputs[:, -self.args.pred_len:, f_dim:]
         target = batch_y[:, -self.args.pred_len:, f_dim:]
-        task_loss = criterion(outputs, target)
 
-        lambda_s, lambda_d, lambda_m = self._stage_lambdas()
-        loss_s = self._stable_loss(outputs, target) if lambda_s > 0 else None
-        loss_d = self._drift_loss(outputs, target) if lambda_d > 0 else None
-        loss_m = self._measurement_loss(batch_x, batch_x_mark, dec_inp, batch_y_mark, outputs, target) if lambda_m > 0 else None
+        if self.camel is not None and self.args.camel_use_nll and sigma is not None:
+            pred_bn = outputs.transpose(1, 2)
+            true_bn = target.transpose(1, 2)
+            task_loss = self.nll_criterion(pred_bn, true_bn, sigma)
+        else:
+            task_loss = criterion(outputs, target)
 
         total_loss = task_loss
-        if loss_s is not None:
-            total_loss = total_loss + lambda_s * loss_s
-        if loss_d is not None:
-            total_loss = total_loss + lambda_d * loss_d
-        if loss_m is not None:
-            total_loss = total_loss + lambda_m * loss_m
-
-        if self.args.enable_btta and self.args.mu_grad > 0:
-            grad_reg = self._gradient_decorrelation([loss_s, loss_d, loss_m], outputs)
-            total_loss = total_loss + self.args.mu_grad * grad_reg
+        if self.camel is not None:
+            total_loss = total_loss + self.args.lambda_mem * aux_losses['mem']
+            total_loss = total_loss + self.args.lambda_ode * aux_losses['ode']
+            total_loss = total_loss + self.args.lambda_smooth * aux_losses['smooth']
 
         return total_loss, outputs
 
@@ -168,17 +137,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
+                if self.camel is not None:
+                    season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step=0)
+                    batch_x, _, _ = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=False)
+
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
@@ -198,6 +165,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
+        self._print_camel_strategy()
         
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -215,6 +183,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
 
+        global_step = 0
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
@@ -243,7 +212,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         
-                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion)
+                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=global_step)
                         train_loss.append(loss.item())
                 else: 
                     if self.args.output_attention:
@@ -290,7 +259,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
 
                     else:
-                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion)
+                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=global_step)
                     
                     train_loss.append(loss.item())
 
@@ -309,6 +278,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 else:
                     loss.backward()
                     model_optim.step()
+                global_step += 1
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -354,18 +324,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
+                if self.camel is not None:
+                    season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step=0)
+                    batch_x, _, _ = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=False)
+
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
