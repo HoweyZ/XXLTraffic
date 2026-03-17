@@ -293,7 +293,7 @@ class Dataset_ETT_minute(Dataset):
 class Dataset_Custom(Dataset):
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
-                 target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None, gap=1):
+                 target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None, gap=1, camel_mark=False):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -318,6 +318,7 @@ class Dataset_Custom(Dataset):
         self.root_path = root_path
         self.data_path = data_path
         self.gap = gap*288
+        self.camel_mark = camel_mark
         self.__read_data__()  
 
     def __read_data__(self):
@@ -357,15 +358,23 @@ class Dataset_Custom(Dataset):
 
         df_stamp = df_raw[['date']][border1:border2]
         df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        years = df_stamp['date'].dt.year.values.astype(np.float32)
+        y_min = years.min() if len(years) > 0 else 0.0
+        y_max = years.max() if len(years) > 0 else 1.0
+        year_norm = (years - y_min) / (max(y_max - y_min, 1e-6))
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
             df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
             df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
             data_stamp = df_stamp.drop(['date'], 1).values
+            if self.camel_mark:
+                data_stamp = np.concatenate([data_stamp, year_norm.reshape(-1, 1)], axis=1)
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
+            if self.camel_mark:
+                data_stamp = np.concatenate([data_stamp, year_norm.reshape(-1, 1)], axis=1)
 
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]
