@@ -5,7 +5,7 @@
 
 cd /g/data/hn98/du/exlts/ddd2
 
-model_name=${1:-CAMEL}
+model_name=${1:-DLinear}
 gap_years=${CAMEL_GAP_YEARS:-1.5}
 
 for pred_len in 96 192 336 720; do
@@ -37,6 +37,7 @@ for pred_len in 96 192 336 720; do
     --train_epochs 200 \
     --patience 5 \
     --lradj 'type3' \
+    --enable_camel \
     --camel_gap_years ${gap_years} \
     --camel_use_nll \
     --lambda_mem 0.10 \

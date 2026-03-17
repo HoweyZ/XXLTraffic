@@ -89,6 +89,8 @@ if __name__ == '__main__':
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
     # CAMEL plug-and-play module
+    parser.add_argument('--enable_camel', action='store_true', default=False,
+                        help='enable CAMEL plug-and-play enhancer before backbone')
     parser.add_argument('--camel_gap_years', type=float, default=0.0,
                         help='gap in years for CAMEL latent extrapolation')
     parser.add_argument('--camel_memory_size', type=int, default=1196,

@@ -66,10 +66,12 @@ class CrossYearEpisodicMemory(nn.Module):
         sim = sim * (0.5 + 0.5 * diversity)
 
         topk_idx = sim.topk(min(self.k, m), dim=-1).indices
-        return self.memory_bank[topk_idx]
+        retrieved = self.memory_bank[topk_idx]
+        return retrieved
 
     def forward(self, x_scalar, season_q, year_q):
-        x4 = x_scalar.unsqueeze(-1)  # [B,T,N,1]
+        # x_scalar: [B, T, N]
+        x4 = x_scalar.unsqueeze(-1)
         b, t, n, _ = x4.shape
         q = self.encoder(x4)
         retrieved = self.retrieve(q, season_q, year_q)  # [B,K,N,d]
@@ -184,15 +186,27 @@ class LatentDynamicsExtrapolator(nn.Module):
         return loss_ode, loss_smooth
 
 
-class AnchorTemporalFusion(nn.Module):
-    def __init__(self, d_model, n_gap_types=4):
+class UncertaintyHead(nn.Module):
+    def __init__(self, d_model, horizon):
         super().__init__()
+        hid = max(4, d_model // 2)
+        self.net = nn.Sequential(nn.Linear(d_model, hid), nn.GELU(), nn.Linear(hid, horizon), nn.Softplus())
+
+    def forward(self, z):
+        return self.net(z) + 1e-6
+
+
+class AnchorTemporalFusion(nn.Module):
+    def __init__(self, d_model, horizon, n_gap_types=4):
+        super().__init__()
+        self.d_model = d_model
         self.gap_embed = nn.Embedding(n_gap_types, d_model)
         self.x_proj = nn.Linear(1, d_model)
         self.gate_net = nn.Sequential(nn.Linear(d_model * 4, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, 3))
         self.out_proj = nn.Linear(d_model, d_model)
         self.delta_head = nn.Linear(d_model, 1)
         self.norm = nn.LayerNorm(d_model)
+        self.uncertainty = UncertaintyHead(d_model, horizon)
 
     def gap_to_idx(self, gap_years):
         mapping = {0.0: 0, 1.0: 1, 1.5: 2, 2.0: 3}
@@ -200,7 +214,8 @@ class AnchorTemporalFusion(nn.Module):
 
     def forward(self, h_cem, h_lde, x_scalar, gap_years=0.0):
         b, t, n = x_scalar.shape
-        x_enc_embed = self.x_proj(x_scalar[:, -1, :].unsqueeze(-1))
+        x_enc = x_scalar[:, -1, :].unsqueeze(-1)
+        x_enc_embed = self.x_proj(x_enc)
 
         gap_idx = self.gap_to_idx(gap_years)
         gap_ids = torch.full((b,), gap_idx, dtype=torch.long, device=x_scalar.device)
@@ -211,80 +226,40 @@ class AnchorTemporalFusion(nn.Module):
         z = gates[..., 0:1] * h_cem + gates[..., 1:2] * h_lde + gates[..., 2:3] * x_enc_embed
         z = self.norm(self.out_proj(z))
 
+        sigma = self.uncertainty(z)
         delta = self.delta_head(z).squeeze(-1)
-        return x_scalar + delta.unsqueeze(1).expand(-1, t, -1)
+        z_out = x_scalar + delta.unsqueeze(1).expand(-1, t, -1)
+        return z_out, sigma
 
 
-class Model(nn.Module):
-    """CAMEL standalone forecasting model, parallel to DLinear/Autoformer."""
+class NLLLoss(nn.Module):
+    def forward(self, pred, target, sigma):
+        return (((pred - target) ** 2) / (2 * sigma ** 2) + torch.log(sigma)).mean()
 
-    def __init__(self, configs):
+
+class CAMEL(nn.Module):
+    def __init__(self, d_model, N_nodes, memory_size=1196, K_retrieve=8, d_latent=32, horizon=12,
+                 lambda_mem=0.10, lambda_ode=0.05, lambda_smt=0.01):
         super().__init__()
-        self.task_name = configs.task_name
-        self.seq_len = configs.seq_len
-        self.pred_len = configs.pred_len if self.task_name in ['long_term_forecast', 'short_term_forecast'] else configs.seq_len
-        self.n_nodes = configs.enc_in
+        self.lambda_mem = lambda_mem
+        self.lambda_ode = lambda_ode
+        self.lambda_smt = lambda_smt
 
-        self.camel_gap_years = getattr(configs, 'camel_gap_years', 0.0)
-        self.lambda_mem = getattr(configs, 'lambda_mem', 0.10)
-        self.lambda_ode = getattr(configs, 'lambda_ode', 0.05)
-        self.lambda_smooth = getattr(configs, 'lambda_smooth', 0.01)
+        self.cem = CrossYearEpisodicMemory(d_model=d_model, n_nodes=N_nodes, memory_size=memory_size, k_retrieve=K_retrieve)
+        self.lde = LatentDynamicsExtrapolator(d_model=d_model, n_nodes=N_nodes, d_latent=d_latent)
+        self.atf = AnchorTemporalFusion(d_model=d_model, horizon=horizon)
 
-        d_model = getattr(configs, 'camel_d_model', 32)
-        d_latent = getattr(configs, 'camel_latent_dim', 32)
-        memory_size = getattr(configs, 'camel_memory_size', 1196)
-        k_retrieve = getattr(configs, 'camel_k_retrieve', 8)
-
-        self.cem = CrossYearEpisodicMemory(d_model=d_model, n_nodes=self.n_nodes,
-                                           memory_size=memory_size, k_retrieve=k_retrieve)
-        self.lde = LatentDynamicsExtrapolator(d_model=d_model, n_nodes=self.n_nodes, d_latent=d_latent)
-        self.atf = AnchorTemporalFusion(d_model=d_model)
-
-        self.temporal_head = nn.Linear(self.seq_len, self.pred_len)
-        self.temporal_head.weight = nn.Parameter((1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
-
-    def _extract_meta(self, x_mark_enc, x_enc):
-        b = x_enc.shape[0]
-        season_q = torch.zeros(b, dtype=torch.long, device=x_enc.device)
-        year_q = torch.zeros(b, dtype=x_enc.dtype, device=x_enc.device)
-
-        if x_mark_enc is not None and x_mark_enc.shape[-1] > 0:
-            month_like = x_mark_enc[:, -1, 0]
-            if month_like.min() >= 1 and month_like.max() <= 12:
-                season_q = ((month_like.long() - 1) // 3).clamp(min=0, max=3)
-
-            if x_mark_enc.shape[-1] >= 5:
-                year_q = x_mark_enc[:, -1, -1].float().clamp(0.0, 1.0)
-        return season_q, year_q
-
-    def _camel_enhance(self, x_enc, x_mark_enc):
-        season_q, year_q = self._extract_meta(x_mark_enc, x_enc)
-
-        h_cem, q = self.cem(x_enc, season_q, year_q)
-        h_lde = self.lde(x_enc, self.camel_gap_years)
-        x_enh = self.atf(h_cem, h_lde, x_enc, self.camel_gap_years)
+    def forward(self, x_scalar, season_q, year_q, gap_years=0.0, update_memory=True):
+        h_cem, q = self.cem(x_scalar, season_q, year_q)
+        h_lde = self.lde(x_scalar, gap_years)
+        z_out, sigma = self.atf(h_cem, h_lde, x_scalar, gap_years)
 
         loss_mem = self.cem.contrastive_loss(q, season_q, year_q)
-        loss_ode, loss_smooth = self.lde.ode_reconstruction_loss(x_enc)
-        aux_loss = self.lambda_mem * loss_mem + self.lambda_ode * loss_ode + self.lambda_smooth * loss_smooth
+        loss_ode, loss_smooth = self.lde.ode_reconstruction_loss(x_scalar)
 
-        if self.training:
+        if update_memory:
             with torch.no_grad():
                 self.cem.update_memory(q.detach(), season_q.detach(), year_q.detach())
 
-        return x_enh, aux_loss
-
-    def forecast(self, x_enc, x_mark_enc):
-        x_enh, aux_loss = self._camel_enhance(x_enc, x_mark_enc)
-        out = self.temporal_head(x_enh.transpose(1, 2)).transpose(1, 2)
-        return out, aux_loss
-
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        if self.task_name not in ['long_term_forecast', 'short_term_forecast']:
-            out, _ = self.forecast(x_enc, x_mark_enc)
-            return out
-
-        out, aux_loss = self.forecast(x_enc, x_mark_enc)
-        # trick: keep return shape aligned, inject aux loss into graph without changing outputs.
-        out = out + 0.0 * aux_loss
-        return out[:, -self.pred_len:, :]
+        aux = {'mem': loss_mem, 'ode': loss_ode, 'smooth': loss_smooth}
+        return z_out, sigma, aux
