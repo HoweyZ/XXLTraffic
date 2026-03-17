@@ -26,7 +26,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, default=1, help='status')
     parser.add_argument('--model_id', type=str, default='test', help='model id')
     parser.add_argument('--model', type=str,  default='DLinear',
-                        help='model name, options: [Autoformer, Transformer, TimesNet]')
+                        help='model name, options include [Autoformer, DLinear, TimesNet, CAMEL, ...]')
 
     # data loader
     parser.add_argument('--data', type=str, default='custom', help='dataset type')
@@ -88,9 +88,9 @@ if __name__ == '__main__':
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
-    # CAMEL plug-and-play module
+    # CAMEL standalone model hyper-parameters
     parser.add_argument('--enable_camel', action='store_true', default=False,
-                        help='enable CAMEL plug-and-play enhancer before backbone')
+                        help='deprecated switch for compatibility; CAMEL should be used via --model CAMEL')
     parser.add_argument('--camel_gap_years', type=float, default=0.0,
                         help='gap in years for CAMEL latent extrapolation')
     parser.add_argument('--camel_memory_size', type=int, default=1196,
