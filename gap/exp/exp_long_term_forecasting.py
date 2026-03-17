@@ -11,7 +11,6 @@ import warnings
 import numpy as np
 from thop import profile, clever_format
 import torch.nn.functional as F
-from itertools import combinations
 
 
 warnings.filterwarnings('ignore')
@@ -33,125 +32,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        params = self.model.parameters()
-        if self.args.enable_btta and self.args.btta_stage == 'btta' and self.args.freeze_backbone_in_btta:
-            for p in self.model.parameters():
-                p.requires_grad = False
-            params = [p for p in self.model.parameters() if p.requires_grad]
-            if len(params) == 0:
-                print('Warning: backbone is frozen in BTTA stage and no adapters are registered; falling back to full-model update.')
-                for p in self.model.parameters():
-                    p.requires_grad = True
-                params = self.model.parameters()
-
-        model_optim = optim.Adam(params, lr=self.args.learning_rate)
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
 
     def _select_criterion(self):
         criterion = nn.MSELoss()
         return criterion
 
-    def _extract_trend(self, x):
-        kernel = max(1, int(self.args.trend_kernel))
-        if kernel % 2 == 0:
-            kernel += 1
-        x_reshape = x.transpose(1, 2)
-        trend = F.avg_pool1d(x_reshape, kernel_size=kernel, stride=1, padding=kernel // 2)
-        return trend.transpose(1, 2)
-
-    def _stable_loss(self, outputs, target):
-        scale = max(1, int(self.args.stable_agg_scale))
-        if outputs.shape[1] < scale:
-            return outputs.new_tensor(0.0)
-        valid_len = (outputs.shape[1] // scale) * scale
-        outputs_agg = outputs[:, :valid_len, :].reshape(outputs.shape[0], valid_len // scale, scale, outputs.shape[2]).mean(dim=2)
-        target_agg = target[:, :valid_len, :].reshape(target.shape[0], valid_len // scale, scale, target.shape[2]).mean(dim=2)
-        return F.mse_loss(outputs_agg, target_agg)
-
-    def _drift_loss(self, outputs, target):
-        return F.mse_loss(self._extract_trend(outputs), self._extract_trend(target))
-
-    def _measurement_loss(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, outputs, target):
-        mask_ratio = float(self.args.measurement_mask_ratio)
-        if mask_ratio <= 0:
-            return outputs.new_tensor(0.0)
-
-        x_mask = (torch.rand_like(batch_x) > mask_ratio).float()
-        masked_x = batch_x * x_mask
-        if self.args.output_attention:
-            masked_outputs = self.model(masked_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-        else:
-            masked_outputs = self.model(masked_x, batch_x_mark, dec_inp, batch_y_mark)
-
-        f_dim = -1 if self.args.features == 'MS' else 0
-        masked_outputs = masked_outputs[:, -self.args.pred_len:, f_dim:]
-        omega = (torch.rand_like(target) < mask_ratio).float()
-        recon = F.l1_loss(masked_outputs * omega, target * omega)
-
-        error_signal = (masked_outputs - outputs.detach()).abs()
-        logits = (error_signal - error_signal.mean(dim=1, keepdim=True))
-        pattern = F.binary_cross_entropy_with_logits(logits, omega)
-        return recon + pattern
-
-    def _gradient_decorrelation(self, losses, outputs):
-        valid = [loss for loss in losses if loss is not None]
-        if len(valid) < 2:
-            return outputs.new_tensor(0.0)
-
-        grads = []
-        for loss in valid:
-            grad = torch.autograd.grad(loss, outputs, retain_graph=True, create_graph=True, allow_unused=True)[0]
-            if grad is not None:
-                grads.append(grad.reshape(grad.shape[0], -1).mean(dim=0))
-        if len(grads) < 2:
-            return outputs.new_tensor(0.0)
-
-        reg = outputs.new_tensor(0.0)
-        for g1, g2 in combinations(grads, 2):
-            reg = reg + torch.abs(F.cosine_similarity(g1, g2, dim=0, eps=1e-8))
-        return reg
-
-    def _stage_lambdas(self):
-        ls, ld, lm = self.args.lambda_s, self.args.lambda_d, self.args.lambda_m
-        if not self.args.enable_btta:
-            return 0.0, 0.0, 0.0
-        if self.args.btta_stage == 'pretrain':
-            return ls, 0.0, lm
-        if self.args.btta_stage == 'bta':
-            return ls, ld, lm
-        if self.args.btta_stage == 'btta':
-            return 0.0, 0.0, lm
-        return ls, ld, lm
-
-    def _compute_total_loss(self, batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion):
-        if self.args.output_attention:
-            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-        else:
-            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-        f_dim = -1 if self.args.features == 'MS' else 0
-        outputs = outputs[:, -self.args.pred_len:, f_dim:]
-        target = batch_y[:, -self.args.pred_len:, f_dim:]
-        task_loss = criterion(outputs, target)
-
-        lambda_s, lambda_d, lambda_m = self._stage_lambdas()
-        loss_s = self._stable_loss(outputs, target) if lambda_s > 0 else None
-        loss_d = self._drift_loss(outputs, target) if lambda_d > 0 else None
-        loss_m = self._measurement_loss(batch_x, batch_x_mark, dec_inp, batch_y_mark, outputs, target) if lambda_m > 0 else None
-
-        total_loss = task_loss
-        if loss_s is not None:
-            total_loss = total_loss + lambda_s * loss_s
-        if loss_d is not None:
-            total_loss = total_loss + lambda_d * loss_d
-        if loss_m is not None:
-            total_loss = total_loss + lambda_m * loss_m
-
-        if self.args.enable_btta and self.args.mu_grad > 0:
-            grad_reg = self._gradient_decorrelation([loss_s, loss_d, loss_m], outputs)
-            total_loss = total_loss + self.args.mu_grad * grad_reg
-
-        return total_loss, outputs
+    def _unwrap_model_output(self, model_out):
+        if isinstance(model_out, tuple):
+            return model_out[0], model_out[1]
+        return model_out, None
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
@@ -171,14 +62,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                         else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs, aux_loss = self._unwrap_model_output(raw_out)
                 else:
                     if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs, aux_loss = self._unwrap_model_output(raw_out)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
@@ -243,13 +136,25 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         
-                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion)
+                        if self.args.output_attention:
+                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        else:
+                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs, _ = self._unwrap_model_output(raw_out)
+                        
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        loss = criterion(outputs, batch_y)
+                        if aux_loss is not None:
+                            loss = loss + aux_loss
                         train_loss.append(loss.item())
                 else: 
                     if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs, aux_loss = self._unwrap_model_output(raw_out)
                     f_dim = -1 if self.args.features == 'MS' else 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
@@ -290,7 +195,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
 
                     else:
-                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion)
+                        loss = criterion(outputs, batch_y)
+                        if aux_loss is not None:
+                            loss = loss + aux_loss
                     
                     train_loss.append(loss.item())
 
@@ -357,15 +264,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                         else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs, _ = self._unwrap_model_output(raw_out)
                 else:
                     if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                     else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs, _ = self._unwrap_model_output(raw_out)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
