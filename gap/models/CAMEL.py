@@ -51,7 +51,7 @@ class CrossYearEpisodicMemory(nn.Module):
         self.memory_ptr[0] = (ptr + 1) % self.memory_bank.shape[0]
 
     def retrieve(self, q, season_q, year_q):
-        b, n, d = q.shape
+        b, _, _ = q.shape
         m = self.memory_bank.shape[0]
 
         q_flat = F.normalize(q.reshape(b, -1), dim=-1)
@@ -66,16 +66,14 @@ class CrossYearEpisodicMemory(nn.Module):
         sim = sim * (0.5 + 0.5 * diversity)
 
         topk_idx = sim.topk(min(self.k, m), dim=-1).indices
-        retrieved = self.memory_bank[topk_idx]
-        return retrieved
+        return self.memory_bank[topk_idx]
 
     def forward(self, x_scalar, season_q, year_q):
         # x_scalar: [B, T, N]
-        x4 = x_scalar.unsqueeze(-1)
-        b, t, n, _ = x4.shape
-        q = self.encoder(x4)
+        q = self.encoder(x_scalar.unsqueeze(-1))
         retrieved = self.retrieve(q, season_q, year_q)  # [B,K,N,d]
 
+        b, n, _ = q.shape
         q_attn = q.reshape(b * n, 1, -1)
         kv_attn = retrieved.permute(0, 2, 1, 3).reshape(b * n, retrieved.shape[1], -1)
         out, _ = self.cross_attn(q_attn, kv_attn, kv_attn)
@@ -83,14 +81,14 @@ class CrossYearEpisodicMemory(nn.Module):
         return self.proj(out), q
 
     def contrastive_loss(self, q, season_q, year_q):
-        b, n, d = q.shape
+        b, _, _ = q.shape
         q_flat = F.normalize(q.reshape(b, -1), dim=-1)
         m = self.memory_bank.shape[0]
         mem_flat = F.normalize(self.memory_bank.reshape(m, -1), dim=-1)
         logits = (q_flat @ mem_flat.T) / max(self.tau_contrast, 1e-6)
 
         delta_year = (year_q.unsqueeze(1) - self.memory_years.unsqueeze(0)).abs()
-        season_match = (season_q.unsqueeze(1) == self.memory_seasons.unsqueeze(0))
+        season_match = season_q.unsqueeze(1) == self.memory_seasons.unsqueeze(0)
         pos_mask = season_match & (delta_year > 1.0)
 
         loss = logits.new_tensor(0.0)
@@ -168,14 +166,13 @@ class LatentDynamicsExtrapolator(nn.Module):
         return z
 
     def forward(self, x_scalar, gap_years=0.0):
-        x_last = x_scalar[:, -1, :].unsqueeze(-1)
-        z0 = self.encoder(x_last)
+        z0 = self.encoder(x_scalar[:, -1, :].unsqueeze(-1))
         gap_steps = float(gap_years) * 365 * 24 * 12
         z_gap = self.euler_integrate(z0, 0, gap_steps) if gap_steps > 0 else z0
         return self.decoder(z_gap)
 
     def ode_reconstruction_loss(self, x_scalar):
-        b, t, n = x_scalar.shape
+        _, t, _ = x_scalar.shape
         half = max(1, t // 2)
         z0 = self.encoder(x_scalar[:, half - 1, :].unsqueeze(-1))
         z_hat = self.euler_integrate(z0, 0, half)
@@ -199,7 +196,6 @@ class UncertaintyHead(nn.Module):
 class AnchorTemporalFusion(nn.Module):
     def __init__(self, d_model, horizon, n_gap_types=4):
         super().__init__()
-        self.d_model = d_model
         self.gap_embed = nn.Embedding(n_gap_types, d_model)
         self.x_proj = nn.Linear(1, d_model)
         self.gate_net = nn.Sequential(nn.Linear(d_model * 4, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, 3))
@@ -209,20 +205,16 @@ class AnchorTemporalFusion(nn.Module):
         self.uncertainty = UncertaintyHead(d_model, horizon)
 
     def gap_to_idx(self, gap_years):
-        mapping = {0.0: 0, 1.0: 1, 1.5: 2, 2.0: 3}
-        return mapping.get(float(gap_years), 0)
+        return {0.0: 0, 1.0: 1, 1.5: 2, 2.0: 3}.get(float(gap_years), 0)
 
     def forward(self, h_cem, h_lde, x_scalar, gap_years=0.0):
         b, t, n = x_scalar.shape
-        x_enc = x_scalar[:, -1, :].unsqueeze(-1)
-        x_enc_embed = self.x_proj(x_enc)
+        x_enc_embed = self.x_proj(x_scalar[:, -1, :].unsqueeze(-1))
 
-        gap_idx = self.gap_to_idx(gap_years)
-        gap_ids = torch.full((b,), gap_idx, dtype=torch.long, device=x_scalar.device)
+        gap_ids = torch.full((b,), self.gap_to_idx(gap_years), dtype=torch.long, device=x_scalar.device)
         e_gap = self.gap_embed(gap_ids).unsqueeze(1).expand(-1, n, -1)
 
-        gate_in = torch.cat([h_cem, h_lde, x_enc_embed, e_gap], dim=-1)
-        gates = F.softmax(self.gate_net(gate_in), dim=-1)
+        gates = F.softmax(self.gate_net(torch.cat([h_cem, h_lde, x_enc_embed, e_gap], dim=-1)), dim=-1)
         z = gates[..., 0:1] * h_cem + gates[..., 1:2] * h_lde + gates[..., 2:3] * x_enc_embed
         z = self.norm(self.out_proj(z))
 
@@ -237,16 +229,11 @@ class NLLLoss(nn.Module):
         return (((pred - target) ** 2) / (2 * sigma ** 2) + torch.log(sigma)).mean()
 
 
-class CAMEL(nn.Module):
-    def __init__(self, d_model, N_nodes, memory_size=1196, K_retrieve=8, d_latent=32, horizon=12,
-                 lambda_mem=0.10, lambda_ode=0.05, lambda_smt=0.01):
+class CAMELCore(nn.Module):
+    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, d_latent=32, horizon=12):
         super().__init__()
-        self.lambda_mem = lambda_mem
-        self.lambda_ode = lambda_ode
-        self.lambda_smt = lambda_smt
-
-        self.cem = CrossYearEpisodicMemory(d_model=d_model, n_nodes=N_nodes, memory_size=memory_size, k_retrieve=K_retrieve)
-        self.lde = LatentDynamicsExtrapolator(d_model=d_model, n_nodes=N_nodes, d_latent=d_latent)
+        self.cem = CrossYearEpisodicMemory(d_model=d_model, n_nodes=n_nodes, memory_size=memory_size, k_retrieve=k_retrieve)
+        self.lde = LatentDynamicsExtrapolator(d_model=d_model, n_nodes=n_nodes, d_latent=d_latent)
         self.atf = AnchorTemporalFusion(d_model=d_model, horizon=horizon)
 
     def forward(self, x_scalar, season_q, year_q, gap_years=0.0, update_memory=True):
@@ -263,3 +250,74 @@ class CAMEL(nn.Module):
 
         aux = {'mem': loss_mem, 'ode': loss_ode, 'smooth': loss_smooth}
         return z_out, sigma, aux
+
+
+class Model(nn.Module):
+    """CAMEL as a standalone forecasting model parallel to DLinear/Autoformer."""
+
+    def __init__(self, configs):
+        super().__init__()
+        self.task_name = configs.task_name
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len if self.task_name in ['long_term_forecast', 'short_term_forecast'] else configs.seq_len
+        self.output_attention = getattr(configs, 'output_attention', False)
+
+        self.core = CAMELCore(
+            d_model=configs.camel_d_model,
+            n_nodes=configs.enc_in,
+            memory_size=configs.camel_memory_size,
+            k_retrieve=configs.camel_k_retrieve,
+            d_latent=configs.camel_latent_dim,
+            horizon=self.pred_len,
+        )
+        self.temporal_proj = nn.Linear(self.seq_len, self.pred_len)
+        self.camel_gap_years = getattr(configs, 'camel_gap_years', 0.0)
+
+    def _extract_meta(self, x_mark_enc, x_enc):
+        b = x_enc.shape[0]
+        season_q = torch.zeros(b, dtype=torch.long, device=x_enc.device)
+        year_q = torch.zeros(b, dtype=x_enc.dtype, device=x_enc.device)
+
+        if x_mark_enc is None or x_mark_enc.shape[-1] == 0:
+            return season_q, year_q
+
+        month_like = x_mark_enc[:, -1, 0]
+        if month_like.min() >= 1 and month_like.max() <= 12:
+            season_q = ((month_like.long() - 1) // 3).clamp(min=0, max=3)
+
+        if x_mark_enc.shape[-1] >= 5:
+            year_q = x_mark_enc[:, -1, -1].float().clamp(0.0, 1.0)
+
+        return season_q, year_q
+
+    def _forward_forecast(self, x_enc, x_mark_enc):
+        season_q, year_q = self._extract_meta(x_mark_enc, x_enc)
+        enhanced, sigma, aux_losses = self.core(
+            x_enc,
+            season_q=season_q,
+            year_q=year_q,
+            gap_years=getattr(self, 'camel_gap_years', 0.0),
+            update_memory=self.training,
+        )
+        pred = self.temporal_proj(enhanced.transpose(1, 2)).transpose(1, 2)
+        return pred[:, -self.pred_len:, :], {'sigma': sigma, 'aux_losses': aux_losses}
+
+    @property
+    def camel_gap_years(self):
+        return getattr(self, '_camel_gap_years', 0.0)
+
+    @camel_gap_years.setter
+    def camel_gap_years(self, value):
+        self._camel_gap_years = float(value)
+
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+        if self.task_name in ['long_term_forecast', 'short_term_forecast']:
+            pred, aux = self._forward_forecast(x_enc, x_mark_enc)
+            return pred, aux
+        if self.task_name in ['imputation', 'anomaly_detection']:
+            pred, _ = self._forward_forecast(x_enc, x_mark_enc)
+            return pred
+        if self.task_name == 'classification':
+            pred, _ = self._forward_forecast(x_enc, x_mark_enc)
+            return pred.reshape(pred.shape[0], -1)
+        return None

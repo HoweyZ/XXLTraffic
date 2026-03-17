@@ -1,6 +1,6 @@
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
-from utils.tools import EarlyStopping, adjust_learning_rate, visual
+from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric
 import torch
 import torch.nn as nn
@@ -9,10 +9,7 @@ import os
 import time
 import warnings
 import numpy as np
-from thop import profile, clever_format
-from models.CAMEL import CAMEL, NLLLoss
-import torch.nn.functional as F
-
+from models.CAMEL import NLLLoss
 
 warnings.filterwarnings('ignore')
 
@@ -20,29 +17,16 @@ warnings.filterwarnings('ignore')
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
-        self.camel = CAMEL(
-            d_model=args.camel_d_model,
-            N_nodes=args.enc_in,
-            memory_size=args.camel_memory_size,
-            K_retrieve=args.camel_k_retrieve,
-            d_latent=args.camel_latent_dim,
-            horizon=args.pred_len,
-            lambda_mem=args.lambda_mem,
-            lambda_ode=args.lambda_ode,
-            lambda_smt=args.lambda_smooth
-        ).to(self.device) if args.enable_camel else None
         self.nll_criterion = NLLLoss()
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
-
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model)
         return model
 
     def _get_data(self, flag):
-        data_set, data_loader = data_provider(self.args, flag)
-        return data_set, data_loader
+        return data_provider(self.args, flag)
 
     def _select_optimizer(self):
         return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
@@ -50,244 +34,124 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def _select_criterion(self):
         return nn.MSELoss()
 
-    def _extract_camel_meta(self, batch_x_mark, batch_x, global_step):
-        B = batch_x.shape[0]
-        season_q = torch.zeros(B, dtype=torch.long, device=batch_x.device)
-        year_q = torch.zeros(B, dtype=batch_x.dtype, device=batch_x.device)
+    def _prepare_marks(self, batch_x_mark, batch_y_mark):
+        if self.args.model == 'CAMEL':
+            return batch_x_mark, batch_y_mark
+        model_x_mark = batch_x_mark[..., :4] if batch_x_mark is not None and batch_x_mark.shape[-1] > 4 else batch_x_mark
+        model_y_mark = batch_y_mark[..., :4] if batch_y_mark is not None and batch_y_mark.shape[-1] > 4 else batch_y_mark
+        return model_x_mark, model_y_mark
 
-        if batch_x_mark is not None and batch_x_mark.shape[-1] > 0:
-            month_like = batch_x_mark[:, -1, 0]
-            if month_like.min() >= 1 and month_like.max() <= 12:
-                season_q = ((month_like.long() - 1) // 3).clamp(min=0, max=3)
+    def _unwrap_model_output(self, raw_out):
+        if isinstance(raw_out, tuple):
+            return raw_out[0], raw_out[1]
+        if isinstance(raw_out, dict):
+            return raw_out.get('pred'), raw_out
+        return raw_out, {}
 
-            # If camel_mark is enabled in dataset, the last dimension carries normalized year.
-            if batch_x_mark.shape[-1] >= 5:
-                year_q = batch_x_mark[:, -1, -1].float().clamp(0.0, 1.0)
-            else:
-                year_q = torch.full_like(year_q, float(global_step % 1024) / 1024.0)
-        else:
-            year_q = torch.full_like(year_q, float(global_step % 1024) / 1024.0)
-        return season_q, year_q
+    def _compute_total_loss(self, batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion):
+        model_x_mark, model_y_mark = self._prepare_marks(batch_x_mark, batch_y_mark)
 
-    def _print_camel_strategy(self):
-        if not self.args.enable_camel:
-            print('CAMEL disabled: backbone-only training with task loss.')
-            return
-        print(f"CAMEL enabled: gap_years={self.args.camel_gap_years}, memory_size={self.args.camel_memory_size}, K={self.args.camel_k_retrieve}")
-        print(f"CAMEL loss weights: lambda_mem={self.args.lambda_mem}, lambda_ode={self.args.lambda_ode}, lambda_smooth={self.args.lambda_smooth}")
-        print(f"CAMEL uncertainty NLL: {'on' if self.args.camel_use_nll else 'off'}")
-
-    def _forward_backbone(self, batch_x, batch_x_mark, dec_inp, batch_y_mark):
-        model_x_mark = batch_x_mark
-        model_y_mark = batch_y_mark
-        if batch_x_mark is not None and batch_x_mark.shape[-1] > 4:
-            model_x_mark = batch_x_mark[..., :4]
-        if batch_y_mark is not None and batch_y_mark.shape[-1] > 4:
-            model_y_mark = batch_y_mark[..., :4]
-
-        if self.args.output_attention:
-            return self.model(batch_x, model_x_mark, dec_inp, model_y_mark)[0]
-        return self.model(batch_x, model_x_mark, dec_inp, model_y_mark)
-
-    def _compute_total_loss(self, batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=0):
-        if self.camel is not None:
-            season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step)
-            batch_x_enh, sigma, aux_losses = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=self.model.training)
-        else:
-            batch_x_enh, sigma = batch_x, None
-            aux_losses = {
-                'mem': batch_x.new_tensor(0.0),
-                'ode': batch_x.new_tensor(0.0),
-                'smooth': batch_x.new_tensor(0.0)
-            }
-
-        outputs = self._forward_backbone(batch_x_enh, batch_x_mark, dec_inp, batch_y_mark)
+        raw_out = self.model(batch_x, model_x_mark, dec_inp, model_y_mark)
+        outputs, extra = self._unwrap_model_output(raw_out)
 
         f_dim = -1 if self.args.features == 'MS' else 0
         outputs = outputs[:, -self.args.pred_len:, f_dim:]
         target = batch_y[:, -self.args.pred_len:, f_dim:]
 
-        if self.camel is not None and self.args.camel_use_nll and sigma is not None:
-            pred_bn = outputs.transpose(1, 2)
-            true_bn = target.transpose(1, 2)
-            task_loss = self.nll_criterion(pred_bn, true_bn, sigma)
-        else:
-            task_loss = criterion(outputs, target)
+        task_loss = criterion(outputs, target)
+        if self.args.model == 'CAMEL' and self.args.camel_use_nll and extra.get('sigma') is not None:
+            sigma = extra['sigma'][:, f_dim:, :]
+            task_loss = self.nll_criterion(outputs.transpose(1, 2), target.transpose(1, 2), sigma)
 
         total_loss = task_loss
-        if self.camel is not None:
-            total_loss = total_loss + self.args.lambda_mem * aux_losses['mem']
-            total_loss = total_loss + self.args.lambda_ode * aux_losses['ode']
-            total_loss = total_loss + self.args.lambda_smooth * aux_losses['smooth']
+        aux_losses = extra.get('aux_losses', {}) if isinstance(extra, dict) else {}
+        if self.args.model == 'CAMEL':
+            total_loss = total_loss + self.args.lambda_mem * aux_losses.get('mem', total_loss.new_tensor(0.0))
+            total_loss = total_loss + self.args.lambda_ode * aux_losses.get('ode', total_loss.new_tensor(0.0))
+            total_loss = total_loss + self.args.lambda_smooth * aux_losses.get('smooth', total_loss.new_tensor(0.0))
 
-        return total_loss, outputs
+        return total_loss, outputs, target
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in vali_loader:
                 batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float()
-
+                batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.camel is not None:
-                    season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step=0)
-                    batch_x, _, _ = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=False)
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).to(self.device)
 
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                loss, _, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion)
+                total_loss.append(loss.item())
 
-                pred = outputs.detach().cpu()
-                true = batch_y.detach().cpu()
-                
-                
-                loss = criterion(pred, true)
-
-                total_loss.append(loss)
-        total_loss = np.average(total_loss)
         self.model.train()
-        return total_loss
+        return np.average(total_loss)
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
-        self._print_camel_strategy()
-        
+
         path = os.path.join(self.args.checkpoints, setting)
-        if not os.path.exists(path):
-            os.makedirs(path)
+        os.makedirs(path, exist_ok=True)
 
         time_now = time.time()
-
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
-        
-        c = nn.L1Loss()
-        
-        if self.args.use_amp:
-            scaler = torch.cuda.amp.GradScaler()
 
-        global_step = 0
+        scaler = torch.cuda.amp.GradScaler() if self.args.use_amp else None
+
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
-
             self.model.train()
             epoch_time = time.time()
+
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
+
                 batch_x = batch_x.float().to(self.device)
-                # print('y start')
                 batch_y = batch_y.float().to(self.device)
-                
-                # exit()
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                #macs, params = profile(self.model, inputs=(batch_x, batch_x_mark, dec_inp, batch_y_mark))
-                #macs, params = clever_format([macs, params], "%.3f")
-                #print(macs, params)
-                #exit()
-                # encoder - decoder
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).to(self.device)
+
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        
-                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=global_step)
-                        train_loss.append(loss.item())
-                else: 
-                    if self.args.output_attention:
-                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    else:
-                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    outputs, aux_loss = self._unwrap_model_output(raw_out)
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    if self.args.model == 'CARD':
-                        self.ratio = np.array([max(1/np.sqrt(i+1),0.0) for i in range(self.args.pred_len)])
-                        self.ratio = torch.tensor(self.ratio).unsqueeze(-1).to('cuda')
-                        outputs = outputs *self.ratio
-                        batch_y = batch_y *self.ratio
-                        loss = c(outputs, batch_y)
-
-                        use_h_loss = False
-                        h_level_range = [4,8,16,24,48,96]
-                        h_loss = None
-                        if use_h_loss:                            
-                            for h_level in h_level_range:
-                                batch,length,channel = outputs.shape
-                                # print(outputs.shape)
-                                h_outputs = outputs.transpose(-1,-2).reshape(batch,channel,-1,h_level)
-                                h_outputs = torch.mean(h_outputs,dim = -1,keepdims = True)
-                                h_batch_y = batch_y.transpose(-1,-2).reshape(batch,channel,-1,h_level)
-                                h_batch_y = torch.mean(h_batch_y,dim = -1,keepdims = True)
-                                h_ratio = self.ratio[:h_outputs.shape[-2],:]
-                                # print(h_outputs.shape,h_ratio.shape)
-                                h_ouputs_agg = torch.mean(h_outputs,dim = 1,keepdims = True)
-                                h_batch_y_agg = torch.mean(h_batch_y,dim = 1,keepdims = True)
-
-                                h_outputs = h_outputs*h_ratio
-                                h_batch_y = h_batch_y*h_ratio
-
-                                h_ouputs_agg *= h_ratio
-                                h_batch_y_agg *= h_ratio
-
-                                if h_loss is None:
-                                    h_loss  = c(h_outputs, h_batch_y)*np.sqrt(h_level) /2 +c(h_ouputs_agg, h_batch_y_agg)*np.sqrt(h_level) /2
-                                else:
-                                    h_loss = h_loss + c(h_outputs, h_batch_y)*np.sqrt(h_level) /2 +c(h_ouputs_agg, h_batch_y_agg)*np.sqrt(h_level) /2
-                            # outputs = 0
-
-
-                    else:
-                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=global_step)
-                    
-                    train_loss.append(loss.item())
-
-                if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
-                    speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                    iter_count = 0
-                    time_now = time.time()
-
-                if self.args.use_amp:
+                        loss, _, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion)
                     scaler.scale(loss).backward()
                     scaler.step(model_optim)
                     scaler.update()
                 else:
+                    loss, _, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion)
                     loss.backward()
                     model_optim.step()
-                global_step += 1
 
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+                train_loss.append(loss.item())
+
+                if (i + 1) % 100 == 0:
+                    speed = (time.time() - time_now) / iter_count
+                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                    print(f"\titers: {i + 1}, epoch: {epoch + 1} | loss: {loss.item():.7f}")
+                    print(f"\tspeed: {speed:.4f}s/iter; left time: {left_time:.4f}s")
+                    iter_count = 0
+                    time_now = time.time()
+
+            print(f"Epoch: {epoch + 1} cost time: {time.time() - epoch_time}")
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
-                epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            print(f"Epoch: {epoch + 1}, Steps: {train_steps} | Train Loss: {train_loss:.7f} Vali Loss: {vali_loss:.7f} Test Loss: {test_loss:.7f}")
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -295,9 +159,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             adjust_learning_rate(model_optim, epoch + 1, self.args)
 
-        best_model_path = path + '/' + 'checkpoint.pth'
+        best_model_path = os.path.join(path, 'checkpoint.pth')
         self.model.load_state_dict(torch.load(best_model_path))
-
         return self.model
 
     def test(self, setting, test=0):
@@ -308,80 +171,49 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         preds = []
         trues = []
-        folder_path = './test_results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
 
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
-
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.camel is not None:
-                    season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step=0)
-                    batch_x, _, _ = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=False)
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).to(self.device)
 
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                model_x_mark, model_y_mark = self._prepare_marks(batch_x_mark, batch_y_mark)
+                raw_out = self.model(batch_x, model_x_mark, dec_inp, model_y_mark)
+                outputs, _ = self._unwrap_model_output(raw_out)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:]
+
                 outputs = outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
+
                 if test_data.scale and self.args.inverse:
                     shape = outputs.shape
                     outputs = test_data.inverse_transform(outputs.squeeze(0)).reshape(shape)
                     batch_y = test_data.inverse_transform(batch_y.squeeze(0)).reshape(shape)
 
-                pred = outputs
-                true = batch_y
+                preds.append(outputs)
+                trues.append(batch_y)
 
-                preds.append(pred)
-                trues.append(true)
-                if i % 20 == 0:
-                    input = batch_x.detach().cpu().numpy()
-                    if test_data.scale and self.args.inverse:
-                        shape = input.shape
-                        input = test_data.inverse_transform(input.squeeze(0)).reshape(shape)
-                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
-                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
-                    # visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+        preds = np.array(preds).reshape(-1, self.args.pred_len, preds[0].shape[-1])
+        trues = np.array(trues).reshape(-1, self.args.pred_len, trues[0].shape[-1])
 
-        preds = np.array(preds)
-        trues = np.array(trues)
-        print('test shape:', preds.shape, trues.shape)
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
-        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-        print('test shape:', preds.shape, trues.shape)
-
-        # result save
         folder_path = './results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        os.makedirs(folder_path, exist_ok=True)
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
-        f = open("result_long_term_forecast.txt", 'a')
-        f.write(setting + "  \n")
-        f.write('mse:{}, mae:{}'.format(mse, mae))
-        f.write('\n')
-        f.write('\n')
-        f.close()
+        with open('result_long_term_forecast.txt', 'a') as f:
+            f.write(setting + '  \n')
+            f.write('mse:{}, mae:{}'.format(mse, mae))
+            f.write('\n\n')
 
         np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
-        #np.save(folder_path + 'pred.npy', preds)
-        #np.save(folder_path + 'true.npy', trues)
-
         return
