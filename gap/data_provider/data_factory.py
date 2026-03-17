@@ -112,7 +112,7 @@ def data_provider(args, flag):
             freq=freq,
             seasonal_patterns=args.seasonal_patterns,
             gap=args.gap_day,
-            camel_mark=(getattr(args, 'model', '') == 'CAMEL')
+            camel_mark=getattr(args, 'enable_camel', False)
         )
         # print('dataset: ',data_set)
         print(flag, len(data_set))

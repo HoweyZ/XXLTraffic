@@ -10,6 +10,7 @@ import time
 import warnings
 import numpy as np
 from thop import profile, clever_format
+from models.CAMEL import CAMEL, NLLLoss
 import torch.nn.functional as F
 
 
@@ -19,6 +20,18 @@ warnings.filterwarnings('ignore')
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
+        self.camel = CAMEL(
+            d_model=args.camel_d_model,
+            N_nodes=args.enc_in,
+            memory_size=args.camel_memory_size,
+            K_retrieve=args.camel_k_retrieve,
+            d_latent=args.camel_latent_dim,
+            horizon=args.pred_len,
+            lambda_mem=args.lambda_mem,
+            lambda_ode=args.lambda_ode,
+            lambda_smt=args.lambda_smooth
+        ).to(self.device) if args.enable_camel else None
+        self.nll_criterion = NLLLoss()
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
@@ -32,17 +45,82 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        return model_optim
+        return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
-        return criterion
+        return nn.MSELoss()
 
-    def _unwrap_model_output(self, model_out):
-        if isinstance(model_out, tuple):
-            return model_out[0], model_out[1]
-        return model_out, None
+    def _extract_camel_meta(self, batch_x_mark, batch_x, global_step):
+        B = batch_x.shape[0]
+        season_q = torch.zeros(B, dtype=torch.long, device=batch_x.device)
+        year_q = torch.zeros(B, dtype=batch_x.dtype, device=batch_x.device)
+
+        if batch_x_mark is not None and batch_x_mark.shape[-1] > 0:
+            month_like = batch_x_mark[:, -1, 0]
+            if month_like.min() >= 1 and month_like.max() <= 12:
+                season_q = ((month_like.long() - 1) // 3).clamp(min=0, max=3)
+
+            # If camel_mark is enabled in dataset, the last dimension carries normalized year.
+            if batch_x_mark.shape[-1] >= 5:
+                year_q = batch_x_mark[:, -1, -1].float().clamp(0.0, 1.0)
+            else:
+                year_q = torch.full_like(year_q, float(global_step % 1024) / 1024.0)
+        else:
+            year_q = torch.full_like(year_q, float(global_step % 1024) / 1024.0)
+        return season_q, year_q
+
+    def _print_camel_strategy(self):
+        if not self.args.enable_camel:
+            print('CAMEL disabled: backbone-only training with task loss.')
+            return
+        print(f"CAMEL enabled: gap_years={self.args.camel_gap_years}, memory_size={self.args.camel_memory_size}, K={self.args.camel_k_retrieve}")
+        print(f"CAMEL loss weights: lambda_mem={self.args.lambda_mem}, lambda_ode={self.args.lambda_ode}, lambda_smooth={self.args.lambda_smooth}")
+        print(f"CAMEL uncertainty NLL: {'on' if self.args.camel_use_nll else 'off'}")
+
+    def _forward_backbone(self, batch_x, batch_x_mark, dec_inp, batch_y_mark):
+        model_x_mark = batch_x_mark
+        model_y_mark = batch_y_mark
+        if batch_x_mark is not None and batch_x_mark.shape[-1] > 4:
+            model_x_mark = batch_x_mark[..., :4]
+        if batch_y_mark is not None and batch_y_mark.shape[-1] > 4:
+            model_y_mark = batch_y_mark[..., :4]
+
+        if self.args.output_attention:
+            return self.model(batch_x, model_x_mark, dec_inp, model_y_mark)[0]
+        return self.model(batch_x, model_x_mark, dec_inp, model_y_mark)
+
+    def _compute_total_loss(self, batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=0):
+        if self.camel is not None:
+            season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step)
+            batch_x_enh, sigma, aux_losses = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=self.model.training)
+        else:
+            batch_x_enh, sigma = batch_x, None
+            aux_losses = {
+                'mem': batch_x.new_tensor(0.0),
+                'ode': batch_x.new_tensor(0.0),
+                'smooth': batch_x.new_tensor(0.0)
+            }
+
+        outputs = self._forward_backbone(batch_x_enh, batch_x_mark, dec_inp, batch_y_mark)
+
+        f_dim = -1 if self.args.features == 'MS' else 0
+        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+        target = batch_y[:, -self.args.pred_len:, f_dim:]
+
+        if self.camel is not None and self.args.camel_use_nll and sigma is not None:
+            pred_bn = outputs.transpose(1, 2)
+            true_bn = target.transpose(1, 2)
+            task_loss = self.nll_criterion(pred_bn, true_bn, sigma)
+        else:
+            task_loss = criterion(outputs, target)
+
+        total_loss = task_loss
+        if self.camel is not None:
+            total_loss = total_loss + self.args.lambda_mem * aux_losses['mem']
+            total_loss = total_loss + self.args.lambda_ode * aux_losses['ode']
+            total_loss = total_loss + self.args.lambda_smooth * aux_losses['smooth']
+
+        return total_loss, outputs
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
@@ -59,19 +137,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
+                if self.camel is not None:
+                    season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step=0)
+                    batch_x, _, _ = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=False)
+
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        else:
-                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        outputs, aux_loss = self._unwrap_model_output(raw_out)
+                        outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.args.output_attention:
-                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    else:
-                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    outputs, aux_loss = self._unwrap_model_output(raw_out)
+                    outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
@@ -91,6 +165,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
+        self._print_camel_strategy()
         
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -108,6 +183,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
 
+        global_step = 0
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
@@ -136,18 +212,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         
-                        if self.args.output_attention:
-                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        else:
-                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        outputs, _ = self._unwrap_model_output(raw_out)
-                        
-                        f_dim = -1 if self.args.features == 'MS' else 0
-                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                        loss = criterion(outputs, batch_y)
-                        if aux_loss is not None:
-                            loss = loss + aux_loss
+                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=global_step)
                         train_loss.append(loss.item())
                 else: 
                     if self.args.output_attention:
@@ -195,9 +260,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
 
                     else:
-                        loss = criterion(outputs, batch_y)
-                        if aux_loss is not None:
-                            loss = loss + aux_loss
+                        loss, _ = self._compute_total_loss(batch_x, dec_inp, batch_y, batch_x_mark, batch_y_mark, criterion, global_step=global_step)
                     
                     train_loss.append(loss.item())
 
@@ -216,6 +279,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 else:
                     loss.backward()
                     model_optim.step()
+                global_step += 1
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -261,20 +325,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
+                if self.camel is not None:
+                    season_q, year_q = self._extract_camel_meta(batch_x_mark, batch_x, global_step=0)
+                    batch_x, _, _ = self.camel(batch_x, season_q, year_q, gap_years=self.args.camel_gap_years, update_memory=False)
+
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        else:
-                            raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        outputs, _ = self._unwrap_model_output(raw_out)
+                        outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.args.output_attention:
-                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                    else:
-                        raw_out = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    outputs, _ = self._unwrap_model_output(raw_out)
+                    outputs = self._forward_backbone(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
