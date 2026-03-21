@@ -109,6 +109,14 @@ if __name__ == '__main__':
                         help='weight for CAMEL ODE reconstruction loss')
     parser.add_argument('--lambda_smooth', type=float, default=0.01,
                         help='weight for CAMEL ODE smoothness loss')
+    parser.add_argument('--camel_min_year_gap', type=float, default=1.0,
+                        help='minimum year difference used to form CAMEL positive contrastive pairs')
+    parser.add_argument('--camel_gap_tolerance', type=float, default=0.25,
+                        help='tolerance around target gap years for CAMEL memory retrieval and positives')
+    parser.add_argument('--camel_debug_stats', action='store_true', default=False,
+                        help='print CAMEL season_q distribution and positive-mask hit-rate during training')
+    parser.add_argument('--camel_debug_interval', type=int, default=100,
+                        help='number of batches between CAMEL debug prints')
 
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')

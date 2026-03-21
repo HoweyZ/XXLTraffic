@@ -25,11 +25,15 @@ class TemporalEncoder(nn.Module):
 
 
 class CrossYearEpisodicMemory(nn.Module):
-    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, tau_time=2.0, tau_contrast=0.07):
+    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, tau_time=2.0, tau_contrast=0.07, min_year_gap=1.0, gap_tolerance=0.25, debug_stats=False, debug_interval=100):
         super().__init__()
         self.k = k_retrieve
         self.tau_time = tau_time
         self.tau_contrast = tau_contrast
+        self.min_year_gap = float(min_year_gap)
+        self.gap_tolerance = float(gap_tolerance)
+        self.debug_stats = bool(debug_stats)
+        self.debug_interval = max(1, int(debug_interval))
 
         self.encoder = TemporalEncoder(d_input=1, d_model=d_model, n_nodes=n_nodes)
         self.cross_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
@@ -39,6 +43,8 @@ class CrossYearEpisodicMemory(nn.Module):
         self.register_buffer('memory_seasons', torch.zeros(memory_size, dtype=torch.long))
         self.register_buffer('memory_years', torch.zeros(memory_size))
         self.register_buffer('memory_ptr', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('memory_count', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('debug_counter', torch.zeros(1, dtype=torch.long))
 
     @torch.no_grad()
     def update_memory(self, new_mem, season_label, year_label):
@@ -49,29 +55,42 @@ class CrossYearEpisodicMemory(nn.Module):
         if year_label.numel() > 0:
             self.memory_years[ptr] = float(year_label.mean().item())
         self.memory_ptr[0] = (ptr + 1) % self.memory_bank.shape[0]
+        self.memory_count[0] = min(int(self.memory_count.item()) + 1, self.memory_bank.shape[0])
 
-    def retrieve(self, q, season_q, year_q):
+    def retrieve(self, q, season_q, year_q, gap_years=0.0):
         b, _, _ = q.shape
-        m = self.memory_bank.shape[0]
+        m = int(self.memory_count.item())
+        if m <= 0:
+            return q.unsqueeze(1)
 
         q_flat = F.normalize(q.reshape(b, -1), dim=-1)
-        mem_flat = F.normalize(self.memory_bank.reshape(m, -1), dim=-1)
+        memory_bank = self.memory_bank[:m]
+        memory_seasons = self.memory_seasons[:m]
+        memory_years = self.memory_years[:m]
+
+        mem_flat = F.normalize(memory_bank.reshape(m, -1), dim=-1)
         sim = q_flat @ mem_flat.T
 
-        season_mask = (season_q.unsqueeze(1) == self.memory_seasons.unsqueeze(0)).float()
+        season_mask = (season_q.unsqueeze(1) == memory_seasons.unsqueeze(0)).float()
         sim = sim * season_mask + (1 - season_mask) * (-1e4)
 
-        delta_year = (year_q.unsqueeze(1) - self.memory_years.unsqueeze(0)).abs()
-        diversity = 1.0 - torch.exp(-delta_year / max(self.tau_time, 1e-4))
-        sim = sim * (0.5 + 0.5 * diversity)
+        delta_year = (year_q.unsqueeze(1) - memory_years.unsqueeze(0)).abs()
+        if gap_years and gap_years > 0:
+            gap_center = torch.as_tensor(float(gap_years), dtype=delta_year.dtype, device=delta_year.device)
+            tol = max(self.gap_tolerance, 1e-4)
+            gap_weight = torch.exp(-((delta_year - gap_center) ** 2) / (2 * tol * tol))
+            sim = sim + torch.log(gap_weight + 1e-6)
+        else:
+            diversity = 1.0 - torch.exp(-delta_year / max(self.tau_time, 1e-4))
+            sim = sim * (0.5 + 0.5 * diversity)
 
         topk_idx = sim.topk(min(self.k, m), dim=-1).indices
-        return self.memory_bank[topk_idx]
+        return memory_bank[topk_idx]
 
-    def forward(self, x_scalar, season_q, year_q):
+    def forward(self, x_scalar, season_q, year_q, gap_years=0.0):
         # x_scalar: [B, T, N]
         q = self.encoder(x_scalar.unsqueeze(-1))
-        retrieved = self.retrieve(q, season_q, year_q)  # [B,K,N,d]
+        retrieved = self.retrieve(q, season_q, year_q, gap_years=gap_years)  # [B,K,N,d]
 
         b, n, _ = q.shape
         q_attn = q.reshape(b * n, 1, -1)
@@ -80,21 +99,46 @@ class CrossYearEpisodicMemory(nn.Module):
         out = out.reshape(b, n, -1)
         return self.proj(out), q
 
-    def contrastive_loss(self, q, season_q, year_q):
+    def contrastive_loss(self, q, season_q, year_q, gap_years=0.0, log_stats=False):
         b, _, _ = q.shape
+        m = int(self.memory_count.item())
+        if m <= 0:
+            return q.new_tensor(0.0)
+
+        memory_bank = self.memory_bank[:m]
+        memory_seasons = self.memory_seasons[:m]
+        memory_years = self.memory_years[:m]
+
         q_flat = F.normalize(q.reshape(b, -1), dim=-1)
-        m = self.memory_bank.shape[0]
-        mem_flat = F.normalize(self.memory_bank.reshape(m, -1), dim=-1)
+        mem_flat = F.normalize(memory_bank.reshape(m, -1), dim=-1)
         logits = (q_flat @ mem_flat.T) / max(self.tau_contrast, 1e-6)
 
-        delta_year = (year_q.unsqueeze(1) - self.memory_years.unsqueeze(0)).abs()
-        season_match = season_q.unsqueeze(1) == self.memory_seasons.unsqueeze(0)
-        pos_mask = season_match & (delta_year > 1.0)
+        delta_year = (year_q.unsqueeze(1) - memory_years.unsqueeze(0)).abs()
+        season_match = season_q.unsqueeze(1) == memory_seasons.unsqueeze(0)
+
+        if gap_years and gap_years > 0:
+            gap_center = torch.as_tensor(float(gap_years), dtype=delta_year.dtype, device=delta_year.device)
+            tol = max(self.gap_tolerance, 1e-4)
+            pos_mask = season_match & ((delta_year - gap_center).abs() <= tol)
+        else:
+            pos_mask = season_match & (delta_year > self.min_year_gap)
+
+        if self.debug_stats and log_stats:
+            step = int(self.debug_counter.item())
+            if step % self.debug_interval == 0:
+                season_unique, season_counts = torch.unique(season_q.detach().cpu(), return_counts=True)
+                season_dist = {int(k.item()): int(v.item()) for k, v in zip(season_unique, season_counts)}
+                hit_rate = float(pos_mask.any(dim=1).float().mean().item())
+                print(f"[CAMEL DEBUG] batch={step} season_q_dist={season_dist} pos_mask_hit_rate={hit_rate:.4f}")
+            self.debug_counter[0] = step + 1
 
         loss = logits.new_tensor(0.0)
         valid = 0
         for i in range(b):
             pos = pos_mask[i].nonzero(as_tuple=True)[0]
+            if pos.numel() == 0:
+                fallback = (season_match[i] & (delta_year[i] > self.min_year_gap)).nonzero(as_tuple=True)[0]
+                pos = fallback
             if pos.numel() == 0:
                 continue
             pos_logit = logits[i, pos].mean()
@@ -230,18 +274,18 @@ class NLLLoss(nn.Module):
 
 
 class CAMELCore(nn.Module):
-    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, d_latent=32, horizon=12):
+    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, d_latent=32, horizon=12, min_year_gap=1.0, gap_tolerance=0.25, debug_stats=False, debug_interval=100):
         super().__init__()
-        self.cem = CrossYearEpisodicMemory(d_model=d_model, n_nodes=n_nodes, memory_size=memory_size, k_retrieve=k_retrieve)
+        self.cem = CrossYearEpisodicMemory(d_model=d_model, n_nodes=n_nodes, memory_size=memory_size, k_retrieve=k_retrieve, min_year_gap=min_year_gap, gap_tolerance=gap_tolerance, debug_stats=debug_stats, debug_interval=debug_interval)
         self.lde = LatentDynamicsExtrapolator(d_model=d_model, n_nodes=n_nodes, d_latent=d_latent)
         self.atf = AnchorTemporalFusion(d_model=d_model, horizon=horizon)
 
     def forward(self, x_scalar, season_q, year_q, gap_years=0.0, update_memory=True):
-        h_cem, q = self.cem(x_scalar, season_q, year_q)
+        h_cem, q = self.cem(x_scalar, season_q, year_q, gap_years=gap_years)
         h_lde = self.lde(x_scalar, gap_years)
         z_out, sigma = self.atf(h_cem, h_lde, x_scalar, gap_years)
 
-        loss_mem = self.cem.contrastive_loss(q, season_q, year_q)
+        loss_mem = self.cem.contrastive_loss(q, season_q, year_q, gap_years=gap_years, log_stats=update_memory)
         loss_ode, loss_smooth = self.lde.ode_reconstruction_loss(x_scalar)
 
         if update_memory:
@@ -269,6 +313,10 @@ class Model(nn.Module):
             k_retrieve=configs.camel_k_retrieve,
             d_latent=configs.camel_latent_dim,
             horizon=self.pred_len,
+            min_year_gap=getattr(configs, 'camel_min_year_gap', 1.0),
+            gap_tolerance=getattr(configs, 'camel_gap_tolerance', 0.25),
+            debug_stats=getattr(configs, 'camel_debug_stats', False),
+            debug_interval=getattr(configs, 'camel_debug_interval', 100),
         )
         self.temporal_proj = nn.Linear(self.seq_len, self.pred_len)
         self.camel_gap_years = getattr(configs, 'camel_gap_years', 0.0)
@@ -286,7 +334,7 @@ class Model(nn.Module):
             season_q = ((month_like.long() - 1) // 3).clamp(min=0, max=3)
 
         if x_mark_enc.shape[-1] >= 5:
-            year_q = x_mark_enc[:, -1, -1].float().clamp(0.0, 1.0)
+            year_q = x_mark_enc[:, -1, -1].float()
 
         return season_q, year_q
 
