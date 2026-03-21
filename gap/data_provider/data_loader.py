@@ -359,9 +359,7 @@ class Dataset_Custom(Dataset):
         df_stamp = df_raw[['date']][border1:border2]
         df_stamp['date'] = pd.to_datetime(df_stamp.date)
         years = df_stamp['date'].dt.year.values.astype(np.float32)
-        y_min = years.min() if len(years) > 0 else 0.0
-        y_max = years.max() if len(years) > 0 else 1.0
-        year_norm = (years - y_min) / (max(y_max - y_min, 1e-6))
+        year_value = years
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
@@ -369,12 +367,12 @@ class Dataset_Custom(Dataset):
             df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
             data_stamp = df_stamp.drop(['date'], 1).values
             if self.camel_mark:
-                data_stamp = np.concatenate([data_stamp, year_norm.reshape(-1, 1)], axis=1)
+                data_stamp = np.concatenate([data_stamp, year_value.reshape(-1, 1)], axis=1)
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
             if self.camel_mark:
-                data_stamp = np.concatenate([data_stamp, year_norm.reshape(-1, 1)], axis=1)
+                data_stamp = np.concatenate([data_stamp, year_value.reshape(-1, 1)], axis=1)
 
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]

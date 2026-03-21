@@ -109,6 +109,8 @@ if __name__ == '__main__':
                         help='weight for CAMEL ODE reconstruction loss')
     parser.add_argument('--lambda_smooth', type=float, default=0.01,
                         help='weight for CAMEL ODE smoothness loss')
+    parser.add_argument('--camel_min_year_gap', type=float, default=1.0,
+                        help='minimum year difference used to form CAMEL positive contrastive pairs')
 
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
