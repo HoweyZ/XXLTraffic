@@ -25,15 +25,13 @@ class TemporalEncoder(nn.Module):
 
 
 class CrossYearEpisodicMemory(nn.Module):
-    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, tau_time=2.0, tau_contrast=0.07, min_year_gap=1.0, gap_tolerance=0.25, debug_stats=False, debug_interval=100):
+    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, tau_time=2.0, tau_contrast=0.07, min_year_gap=1.0, gap_tolerance=0.25):
         super().__init__()
         self.k = k_retrieve
         self.tau_time = tau_time
         self.tau_contrast = tau_contrast
         self.min_year_gap = float(min_year_gap)
         self.gap_tolerance = float(gap_tolerance)
-        self.debug_stats = bool(debug_stats)
-        self.debug_interval = max(1, int(debug_interval))
 
         self.encoder = TemporalEncoder(d_input=1, d_model=d_model, n_nodes=n_nodes)
         self.cross_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
@@ -44,7 +42,6 @@ class CrossYearEpisodicMemory(nn.Module):
         self.register_buffer('memory_years', torch.zeros(memory_size))
         self.register_buffer('memory_ptr', torch.zeros(1, dtype=torch.long))
         self.register_buffer('memory_count', torch.zeros(1, dtype=torch.long))
-        self.register_buffer('debug_counter', torch.zeros(1, dtype=torch.long))
 
     @torch.no_grad()
     def update_memory(self, new_mem, season_label, year_label):
@@ -99,7 +96,7 @@ class CrossYearEpisodicMemory(nn.Module):
         out = out.reshape(b, n, -1)
         return self.proj(out), q
 
-    def contrastive_loss(self, q, season_q, year_q, gap_years=0.0, log_stats=False):
+    def contrastive_loss(self, q, season_q, year_q, gap_years=0.0):
         b, _, _ = q.shape
         m = int(self.memory_count.item())
         if m <= 0:
@@ -122,15 +119,6 @@ class CrossYearEpisodicMemory(nn.Module):
             pos_mask = season_match & ((delta_year - gap_center).abs() <= tol)
         else:
             pos_mask = season_match & (delta_year > self.min_year_gap)
-
-        if self.debug_stats and log_stats:
-            step = int(self.debug_counter.item())
-            if step % self.debug_interval == 0:
-                season_unique, season_counts = torch.unique(season_q.detach().cpu(), return_counts=True)
-                season_dist = {int(k.item()): int(v.item()) for k, v in zip(season_unique, season_counts)}
-                hit_rate = float(pos_mask.any(dim=1).float().mean().item())
-                print(f"[CAMEL DEBUG] batch={step} season_q_dist={season_dist} pos_mask_hit_rate={hit_rate:.4f}")
-            self.debug_counter[0] = step + 1
 
         loss = logits.new_tensor(0.0)
         valid = 0
@@ -274,9 +262,9 @@ class NLLLoss(nn.Module):
 
 
 class CAMELCore(nn.Module):
-    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, d_latent=32, horizon=12, min_year_gap=1.0, gap_tolerance=0.25, debug_stats=False, debug_interval=100):
+    def __init__(self, d_model, n_nodes, memory_size=1196, k_retrieve=8, d_latent=32, horizon=12, min_year_gap=1.0, gap_tolerance=0.25):
         super().__init__()
-        self.cem = CrossYearEpisodicMemory(d_model=d_model, n_nodes=n_nodes, memory_size=memory_size, k_retrieve=k_retrieve, min_year_gap=min_year_gap, gap_tolerance=gap_tolerance, debug_stats=debug_stats, debug_interval=debug_interval)
+        self.cem = CrossYearEpisodicMemory(d_model=d_model, n_nodes=n_nodes, memory_size=memory_size, k_retrieve=k_retrieve, min_year_gap=min_year_gap, gap_tolerance=gap_tolerance)
         self.lde = LatentDynamicsExtrapolator(d_model=d_model, n_nodes=n_nodes, d_latent=d_latent)
         self.atf = AnchorTemporalFusion(d_model=d_model, horizon=horizon)
 
@@ -285,7 +273,7 @@ class CAMELCore(nn.Module):
         h_lde = self.lde(x_scalar, gap_years)
         z_out, sigma = self.atf(h_cem, h_lde, x_scalar, gap_years)
 
-        loss_mem = self.cem.contrastive_loss(q, season_q, year_q, gap_years=gap_years, log_stats=update_memory)
+        loss_mem = self.cem.contrastive_loss(q, season_q, year_q, gap_years=gap_years)
         loss_ode, loss_smooth = self.lde.ode_reconstruction_loss(x_scalar)
 
         if update_memory:
@@ -315,8 +303,6 @@ class Model(nn.Module):
             horizon=self.pred_len,
             min_year_gap=getattr(configs, 'camel_min_year_gap', 1.0),
             gap_tolerance=getattr(configs, 'camel_gap_tolerance', 0.25),
-            debug_stats=getattr(configs, 'camel_debug_stats', False),
-            debug_interval=getattr(configs, 'camel_debug_interval', 100),
         )
         self.temporal_proj = nn.Linear(self.seq_len, self.pred_len)
         self.camel_gap_years = getattr(configs, 'camel_gap_years', 0.0)
